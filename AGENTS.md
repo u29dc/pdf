@@ -5,7 +5,6 @@
 - `https://doc.rust-lang.org/cargo/` (build, test, release workflow)
 - `https://docs.rs/clap/latest/clap/` (CLI contracts and argument parsing)
 - `https://docs.rs/lopdf/latest/lopdf/` (PDF parse/rewrite APIs)
-- `/Users/han/Git/dot/agents/skills/align/references/index.md` (project alignment baseline)
 
 ## 2. Repository Structure
 
