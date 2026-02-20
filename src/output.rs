@@ -53,25 +53,31 @@ pub fn emit_tools_json(elapsed_ms: u128) {
 }
 
 pub fn print_optimize_report(report: &RunReport) {
-    println!(
-        "[{}] scanned={} changed={} skipped={} applied={} failed={}",
-        report.mode.to_uppercase(),
-        report.summary.total,
-        report.summary.changed,
-        report.summary.skipped,
-        report.summary.applied,
-        report.summary.failed
+    let mode_label = format!("[{}]", report.mode.to_uppercase());
+    let est_saved_mb = bytes_to_mb(report.summary.estimated_saved_total_bytes);
+    let actual_saved_mb = bytes_to_mb(report.summary.actual_saved_total_bytes);
+
+    print_status_line(
+        &mode_label,
+        &format!(
+            "scanned={} changed={} skipped={} applied={} failed={}",
+            report.summary.total,
+            report.summary.changed,
+            report.summary.skipped,
+            report.summary.applied,
+            report.summary.failed
+        ),
     );
-    println!(
-        "[OPT] checked={} recommended={} est_saved={}B actual_saved={}B",
-        report.summary.optimization_checked,
-        report.summary.optimization_recommended,
-        report.summary.estimated_saved_total_bytes,
-        report.summary.actual_saved_total_bytes
+    print_status_line(
+        "[OPT]",
+        &format!(
+            "checked={} recommended={} est_saved={:.2}MB actual_saved={:.2}MB",
+            report.summary.optimization_checked, report.summary.optimization_recommended, est_saved_mb, actual_saved_mb
+        ),
     );
-    println!("[REPORT] {}", report.report_path);
+    print_status_line("[REPORT]", &report.report_path);
     if !report.backup_root.is_empty() {
-        println!("[BACKUP] {}", report.backup_root);
+        print_status_line("[BACKUP]", &report.backup_root);
     }
 }
 
@@ -115,4 +121,13 @@ fn emit_success_json<T: Serialize>(tool: &str, data: T, elapsed_ms: u128) {
             "{{\"ok\":false,\"error\":{{\"code\":\"serialization_error\",\"message\":\"failed to serialize success envelope\",\"hint\":\"retry\"}},\"meta\":{{\"tool\":\"{tool}\",\"elapsed_ms\":{elapsed_ms}}}}}"
         ),
     }
+}
+
+fn print_status_line(label: &str, message: &str) {
+    const LABEL_WIDTH: usize = 8;
+    println!("{label:<LABEL_WIDTH$} {message}");
+}
+
+fn bytes_to_mb(value: i64) -> f64 {
+    value as f64 / 1_000_000.0
 }
