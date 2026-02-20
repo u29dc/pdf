@@ -1,8 +1,7 @@
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use walkdir::WalkDir;
 
 pub fn collect_pdf_paths(target: &Path) -> Result<Vec<PathBuf>> {
@@ -10,7 +9,7 @@ pub fn collect_pdf_paths(target: &Path) -> Result<Vec<PathBuf>> {
         return Err(anyhow!("target not found: {}", target.display()));
     }
 
-    let mut set = BTreeSet::new();
+    let mut paths = Vec::new();
 
     if target.is_file() {
         if !is_pdf(target) {
@@ -19,26 +18,19 @@ pub fn collect_pdf_paths(target: &Path) -> Result<Vec<PathBuf>> {
         if is_hidden_path(target) {
             return Err(anyhow!("hidden target not allowed: {}", target.display()));
         }
-        let resolved = target
-            .canonicalize()
-            .with_context(|| format!("failed to resolve target: {}", target.display()))?;
-        set.insert(resolved);
-        return Ok(set.into_iter().collect());
+        paths.push(target.to_path_buf());
+        return Ok(paths);
     }
 
     if !target.is_dir() {
         return Err(anyhow!("unsupported target type: {}", target.display()));
     }
 
-    let root = target
-        .canonicalize()
-        .with_context(|| format!("failed to resolve directory: {}", target.display()))?;
-
-    let iter = WalkDir::new(&root)
+    let iter = WalkDir::new(target)
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| {
-            if entry.path() == root {
+            if entry.depth() == 0 {
                 return true;
             }
             !is_hidden_name(entry.file_name())
@@ -56,14 +48,15 @@ pub fn collect_pdf_paths(target: &Path) -> Result<Vec<PathBuf>> {
         if !is_pdf(path) {
             continue;
         }
-        if is_hidden_path(path) {
+        if is_hidden_name(entry.file_name()) {
             continue;
         }
-        let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        set.insert(resolved);
+        paths.push(path.to_path_buf());
     }
 
-    Ok(set.into_iter().collect())
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
 }
 
 pub fn is_hidden_path(path: &Path) -> bool {

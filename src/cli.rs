@@ -51,10 +51,20 @@ pub struct OptimizeArgs {
     pub min_size_savings_percent: f64,
 
     /// Number of worker threads. Defaults to CPU core count.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_jobs)]
     pub jobs: Option<usize>,
 
     /// Skip backup creation in apply mode.
     #[arg(long)]
     pub no_backup: bool,
+}
+
+fn parse_jobs(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --jobs value: {value}"))?;
+    if parsed == 0 {
+        return Err("--jobs must be at least 1".to_string());
+    }
+    Ok(parsed)
 }

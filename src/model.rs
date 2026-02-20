@@ -47,6 +47,8 @@ pub struct FilePlan {
     pub size_after_bytes: Option<u64>,
     pub actual_saved_bytes: Option<i64>,
     pub actual_saved_percent: Option<f64>,
+    #[serde(skip_serializing)]
+    pub staged_optimized_path: Option<String>,
 }
 
 impl FilePlan {
@@ -78,6 +80,7 @@ impl FilePlan {
             size_after_bytes: None,
             actual_saved_bytes: None,
             actual_saved_percent: None,
+            staged_optimized_path: None,
         }
     }
 }

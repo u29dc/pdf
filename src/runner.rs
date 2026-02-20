@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Local;
-use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::cli::OptimizeArgs;
 use crate::model::{FilePlan, RunOptions, RunOptionsView, RunReport, summarize};
@@ -22,15 +22,14 @@ pub fn run_optimize(args: OptimizeArgs) -> Result<RunReport> {
         no_backup: args.no_backup,
     };
 
-    if let Some(jobs) = run_options.jobs {
-        let _ = ThreadPoolBuilder::new().num_threads(jobs).build_global();
-    }
+    let worker_pool = build_thread_pool(run_options.jobs)?;
 
     let target_path = resolve_target_path(&args.path)?;
     let mut files = collect_pdf_paths(&target_path)?;
     files.sort();
 
-    let mut plans: Vec<FilePlan> = files.par_iter().map(|path| analyze_file(path, &run_options)).collect();
+    let mut plans: Vec<FilePlan> =
+        worker_pool.install(|| files.par_iter().map(|path| analyze_file(path, &run_options)).collect());
     plans.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut backup_root_path = String::new();
@@ -43,11 +42,11 @@ pub fn run_optimize(args: OptimizeArgs) -> Result<RunReport> {
             .collect::<Vec<PathBuf>>();
 
         if !run_options.no_backup && !changed_paths.is_empty() {
-            let backup_root = create_backup_snapshot(&changed_paths)?;
+            let backup_root = create_backup_snapshot(&worker_pool, &changed_paths)?;
             backup_root_path = backup_root.display().to_string();
         }
 
-        plans.par_iter_mut().for_each(|plan| apply_file(plan, &run_options));
+        worker_pool.install(|| plans.par_iter_mut().for_each(|plan| apply_file(plan, &run_options)));
     }
 
     let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
@@ -69,6 +68,14 @@ pub fn run_optimize(args: OptimizeArgs) -> Result<RunReport> {
     report.report_path = report_path.display().to_string();
 
     Ok(report)
+}
+
+fn build_thread_pool(jobs: Option<usize>) -> Result<ThreadPool> {
+    let mut builder = ThreadPoolBuilder::new();
+    if let Some(value) = jobs {
+        builder = builder.num_threads(value);
+    }
+    builder.build().context("failed to initialize worker pool")
 }
 
 fn resolve_target_path(input: &Path) -> Result<PathBuf> {
@@ -103,7 +110,7 @@ fn reports_root() -> Result<PathBuf> {
     Ok(pdf_home()?.join("reports"))
 }
 
-fn create_backup_snapshot(paths: &[PathBuf]) -> Result<PathBuf> {
+fn create_backup_snapshot(pool: &ThreadPool, paths: &[PathBuf]) -> Result<PathBuf> {
     let root = backup_root()?;
     fs::create_dir_all(&root).with_context(|| format!("failed to create backup root: {}", root.display()))?;
     let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
@@ -111,21 +118,24 @@ fn create_backup_snapshot(paths: &[PathBuf]) -> Result<PathBuf> {
     fs::create_dir_all(&run_backup_root)
         .with_context(|| format!("failed to create backup directory: {}", run_backup_root.display()))?;
 
-    for source in paths {
-        let relative = source.strip_prefix("/").unwrap_or(source);
-        let destination = run_backup_root.join(relative);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create backup parent path: {}", parent.display()))?;
-        }
-        fs::copy(source, &destination).with_context(|| {
-            format!(
-                "failed to copy backup file: {} -> {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
-    }
+    pool.install(|| {
+        paths.par_iter().try_for_each(|source| -> Result<()> {
+            let relative = source.strip_prefix("/").unwrap_or(source);
+            let destination = run_backup_root.join(relative);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create backup parent path: {}", parent.display()))?;
+            }
+            fs::copy(source, &destination).with_context(|| {
+                format!(
+                    "failed to copy backup file: {} -> {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            Ok(())
+        })
+    })?;
 
     Ok(run_backup_root)
 }

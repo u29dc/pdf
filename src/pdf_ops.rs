@@ -2,9 +2,10 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
-use lopdf::{Dictionary, Document, Object, SaveOptions};
+use lopdf::{Dictionary, Document, Object};
 use tempfile::Builder;
 
 use crate::model::{
@@ -18,18 +19,29 @@ enum RewriteMode {
 }
 
 pub fn analyze_file(path: &Path, options: &RunOptions) -> FilePlan {
-    let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let mut plan = FilePlan::new(path.display().to_string(), size_bytes);
+    let mut plan = FilePlan::new(
+        path.display().to_string(),
+        fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+    );
 
-    let signature_detected = detect_signature_tokens(path).unwrap_or(false);
-    if signature_detected {
+    let file_bytes = match fs::read(path) {
+        Ok(value) => value,
+        Err(err) => {
+            plan.skipped = true;
+            plan.skip_reason = format!("read error: {err}");
+            return plan;
+        }
+    };
+    plan.size_bytes = u64::try_from(file_bytes.len()).unwrap_or(u64::MAX);
+
+    if contains_signature_tokens(&file_bytes) {
         plan.signed = true;
         plan.skipped = true;
         plan.skip_reason = "signed-pdf (byte-range-signature-token)".to_string();
         return plan;
     }
 
-    let doc = match Document::load(path) {
+    let doc = match Document::load_mem(&file_bytes) {
         Ok(value) => value,
         Err(err) => {
             let detail = err.to_string();
@@ -49,8 +61,8 @@ pub fn analyze_file(path: &Path, options: &RunOptions) -> FilePlan {
 
     if options.estimate_size {
         plan.optimization_checked = true;
-        match estimate_optimized_size(path) {
-            Ok(estimated_after) => {
+        match estimate_optimized_output(path, options.apply) {
+            Ok((estimated_after, staged_optimized_path)) => {
                 let before = i64::try_from(plan.size_bytes).unwrap_or(i64::MAX);
                 let after = i64::try_from(estimated_after).unwrap_or(i64::MAX);
                 let saved = before - after;
@@ -62,6 +74,9 @@ pub fn analyze_file(path: &Path, options: &RunOptions) -> FilePlan {
                     saved >= options.min_size_savings_bytes as i64 && saved_pct >= options.min_size_savings_percent;
                 if plan.optimization_recommended {
                     plan.planned_actions.push(ACTION_OPTIMIZE.to_string());
+                }
+                if let Some(staged_path) = staged_optimized_path {
+                    plan.staged_optimized_path = Some(staged_path.display().to_string());
                 }
             }
             Err(err) => {
@@ -85,19 +100,13 @@ pub fn apply_file(plan: &mut FilePlan, options: &RunOptions) {
     let path = PathBuf::from(&plan.path);
     let metadata_needed = plan.planned_actions.iter().any(|action| is_metadata_action(action));
 
-    let optimized_tmp = match create_temp_pdf_path(&path, "optimized") {
+    let optimized_tmp = match resolve_optimized_temp(plan, &path) {
         Ok(value) => value,
         Err(err) => {
-            plan.apply_error = format!("temp error: {err}");
+            plan.apply_error = format!("rewrite error: {err}");
             return;
         }
     };
-
-    if let Err(err) = rewrite_pdf(&path, &optimized_tmp, RewriteMode::Optimized) {
-        let _ = fs::remove_file(&optimized_tmp);
-        plan.apply_error = format!("rewrite error: {err}");
-        return;
-    }
 
     let optimized_size = fs::metadata(&optimized_tmp).map(|m| m.len()).unwrap_or(plan.size_bytes);
     let optimized_saved =
@@ -212,43 +221,66 @@ fn inspect_metadata(doc: &Document, path: &Path, plan: &mut FilePlan) {
     }
 }
 
-fn estimate_optimized_size(path: &Path) -> Result<u64> {
+fn estimate_optimized_output(path: &Path, keep_artifact: bool) -> Result<(u64, Option<PathBuf>)> {
     let temp_path = create_temp_pdf_path(path, "estimate")?;
-    let result = rewrite_pdf(path, &temp_path, RewriteMode::Optimized)
-        .and_then(|_| fs::metadata(&temp_path).map(|meta| meta.len()).map_err(Into::into));
+    if let Err(err) = rewrite_pdf(path, &temp_path, RewriteMode::Optimized) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    let size_after = fs::metadata(&temp_path)
+        .map(|meta| meta.len())
+        .with_context(|| format!("failed to read temp output metadata: {}", temp_path.display()))?;
+    if keep_artifact {
+        return Ok((size_after, Some(temp_path)));
+    }
     let _ = fs::remove_file(&temp_path);
-    result
+    Ok((size_after, None))
 }
 
-fn rewrite_pdf(source_path: &Path, output_path: &Path, mode: RewriteMode) -> Result<()> {
-    let mut doc =
-        Document::load(source_path).with_context(|| format!("failed to load pdf: {}", source_path.display()))?;
-
-    apply_metadata_cleanup(&mut doc, source_path)?;
-    doc.version = TARGET_PDF_VERSION.to_string();
-
-    let output_file = File::create(output_path)
-        .with_context(|| format!("failed to create output file: {}", output_path.display()))?;
-    let mut writer = BufWriter::new(output_file);
-
-    match mode {
-        RewriteMode::MetadataOnly => {
-            doc.save_to(&mut writer)
-                .with_context(|| format!("failed to save metadata rewrite: {}", output_path.display()))?;
-        }
-        RewriteMode::Optimized => {
-            doc.compress();
-            let save_options = SaveOptions::builder()
-                .use_object_streams(true)
-                .use_xref_streams(true)
-                .compression_level(9)
-                .build();
-            doc.save_with_options(&mut writer, save_options)
-                .with_context(|| format!("failed to save optimized rewrite: {}", output_path.display()))?;
+fn resolve_optimized_temp(plan: &mut FilePlan, source_path: &Path) -> Result<PathBuf> {
+    if let Some(staged_path) = plan.staged_optimized_path.take() {
+        let staged = PathBuf::from(staged_path);
+        if staged.exists() {
+            return Ok(staged);
         }
     }
 
-    writer.flush()?;
+    let optimized_tmp = create_temp_pdf_path(source_path, "optimized")?;
+    if let Err(err) = rewrite_pdf(source_path, &optimized_tmp, RewriteMode::Optimized) {
+        let _ = fs::remove_file(&optimized_tmp);
+        return Err(err);
+    }
+    Ok(optimized_tmp)
+}
+
+fn rewrite_pdf(source_path: &Path, output_path: &Path, mode: RewriteMode) -> Result<()> {
+    match mode {
+        RewriteMode::MetadataOnly => {
+            let mut doc = Document::load(source_path)
+                .with_context(|| format!("failed to load pdf: {}", source_path.display()))?;
+            apply_metadata_cleanup(&mut doc, source_path)?;
+            doc.version = TARGET_PDF_VERSION.to_string();
+
+            let output_file = File::create(output_path)
+                .with_context(|| format!("failed to create output file: {}", output_path.display()))?;
+            let mut writer = BufWriter::new(output_file);
+            doc.save_to(&mut writer)
+                .with_context(|| format!("failed to save metadata rewrite: {}", output_path.display()))?;
+            writer.flush()?;
+        }
+        RewriteMode::Optimized => {
+            let metadata_tmp = create_temp_pdf_path(source_path, "metadata-stage")?;
+            let rewrite_result = rewrite_pdf(source_path, &metadata_tmp, RewriteMode::MetadataOnly);
+            if let Err(err) = rewrite_result {
+                let _ = fs::remove_file(&metadata_tmp);
+                return Err(err);
+            }
+
+            let optimize_result = optimize_with_qpdf(&metadata_tmp, output_path);
+            let _ = fs::remove_file(&metadata_tmp);
+            optimize_result?;
+        }
+    }
     Ok(())
 }
 
@@ -333,6 +365,59 @@ fn create_temp_pdf_path(target: &Path, label: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn optimize_with_qpdf(input_path: &Path, output_path: &Path) -> Result<()> {
+    let qpdf_bin = which::which("qpdf").context("qpdf not found; install qpdf for optimization")?;
+
+    let optimize = Command::new(&qpdf_bin)
+        .arg("--object-streams=generate")
+        .arg("--compress-streams=y")
+        .arg("--recompress-flate")
+        .arg("--compression-level=9")
+        .arg(input_path)
+        .arg(output_path)
+        .output()
+        .with_context(|| format!("failed to execute qpdf optimize for {}", input_path.display()))?;
+
+    if !optimize.status.success() {
+        let stderr = String::from_utf8_lossy(&optimize.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&optimize.stdout).to_string();
+        return Err(anyhow!(
+            "qpdf optimize failed for {}: {}{}",
+            input_path.display(),
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" | {}", stdout.trim())
+            }
+        ));
+    }
+
+    let check = Command::new(&qpdf_bin)
+        .arg("--check")
+        .arg(output_path)
+        .output()
+        .with_context(|| format!("failed to execute qpdf check for {}", output_path.display()))?;
+
+    let check_code = check.status.code().unwrap_or(1);
+    if !(check_code == 0 || check_code == 3) {
+        let stderr = String::from_utf8_lossy(&check.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&check.stdout).to_string();
+        return Err(anyhow!(
+            "qpdf output validation failed for {}: {}{}",
+            output_path.display(),
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" | {}", stdout.trim())
+            }
+        ));
+    }
+
+    Ok(())
+}
+
 fn object_to_text(value: &Object) -> String {
     if let Ok(text) = value.as_str() {
         return String::from_utf8_lossy(text).to_string();
@@ -341,11 +426,6 @@ fn object_to_text(value: &Object) -> String {
         return String::from_utf8_lossy(name).to_string();
     }
     format!("{value:?}")
-}
-
-fn detect_signature_tokens(path: &Path) -> Result<bool> {
-    let data = fs::read(path).with_context(|| format!("failed to read file bytes: {}", path.display()))?;
-    Ok(contains_signature_tokens(&data))
 }
 
 fn contains_signature_tokens(data: &[u8]) -> bool {
