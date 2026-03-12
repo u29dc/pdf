@@ -5,6 +5,10 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "pdf", version, about = "Personal PDF utility")]
 pub struct Cli {
+    /// Emit human-readable text instead of the default JSON envelope.
+    #[arg(long, global = true)]
+    pub text: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -19,9 +23,9 @@ pub enum Commands {
 
 #[derive(Debug, Clone, Args)]
 pub struct ToolsArgs {
-    /// Emit JSON output envelope.
-    #[arg(long)]
-    pub json: bool,
+    /// Optional dotted tool name for detail mode.
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -33,10 +37,6 @@ pub struct OptimizeArgs {
     /// Apply changes in place. Without this flag, run is read-only.
     #[arg(long)]
     pub apply: bool,
-
-    /// Emit JSON output envelope.
-    #[arg(long)]
-    pub json: bool,
 
     /// Estimate per-file size savings during planning.
     #[arg(long)]

@@ -20,6 +20,7 @@ pub struct RunOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FilePlan {
     pub path: String,
     pub size_bytes: u64,
@@ -86,6 +87,7 @@ impl FilePlan {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunSummary {
     pub total: usize,
     pub changed: usize,
@@ -103,6 +105,7 @@ pub struct RunSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunReport {
     pub timestamp: String,
     pub mode: String,
@@ -115,6 +118,7 @@ pub struct RunReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunOptionsView {
     pub apply: bool,
     pub estimate_size: bool,

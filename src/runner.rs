@@ -2,17 +2,18 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
 use chrono::Local;
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use serde_json::json;
 
 use crate::cli::OptimizeArgs;
+use crate::error::{CommandError, CommandResult};
 use crate::model::{FilePlan, RunOptions, RunOptionsView, RunReport, summarize};
 use crate::pdf_ops::{analyze_file, apply_file};
 use crate::scanner::collect_pdf_paths;
 
-pub fn run_optimize(args: OptimizeArgs) -> Result<RunReport> {
+pub fn run_optimize(args: OptimizeArgs) -> CommandResult<RunReport> {
     let run_options = RunOptions {
         apply: args.apply,
         estimate_size: args.estimate_size || args.apply,
@@ -70,68 +71,130 @@ pub fn run_optimize(args: OptimizeArgs) -> Result<RunReport> {
     Ok(report)
 }
 
-fn build_thread_pool(jobs: Option<usize>) -> Result<ThreadPool> {
+fn build_thread_pool(jobs: Option<usize>) -> CommandResult<ThreadPool> {
     let mut builder = ThreadPoolBuilder::new();
     if let Some(value) = jobs {
         builder = builder.num_threads(value);
     }
-    builder.build().context("failed to initialize worker pool")
+    builder.build().map_err(|err| {
+        CommandError::blocked(
+            "worker_pool_unavailable",
+            format!("failed to initialize worker pool: {err}"),
+            "Reduce `--jobs` or retry on a host that can create worker threads.",
+        )
+        .with_details(json!({
+            "jobs": jobs,
+            "source": err.to_string(),
+        }))
+    })
 }
 
-fn resolve_target_path(input: &Path) -> Result<PathBuf> {
+fn resolve_target_path(input: &Path) -> CommandResult<PathBuf> {
     if input.is_absolute() {
         return Ok(input.to_path_buf());
     }
-    Ok(env::current_dir()
-        .context("failed to read current directory")?
-        .join(input))
+    let current_dir = env::current_dir().map_err(|err| {
+        CommandError::blocked(
+            "current_directory_unavailable",
+            format!("failed to read current directory: {err}"),
+            "Run the command from a readable directory or pass an absolute path.",
+        )
+        .with_details(json!({
+            "path": input.display().to_string(),
+            "source": err.to_string(),
+        }))
+    })?;
+    Ok(current_dir.join(input))
 }
 
-fn tools_home() -> Result<PathBuf> {
+fn tools_home() -> CommandResult<PathBuf> {
     if let Ok(value) = env::var("TOOLS_HOME") {
         return Ok(PathBuf::from(value));
     }
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory is not available"))?;
+    let home = dirs::home_dir().ok_or_else(|| {
+        CommandError::blocked(
+            "home_directory_unavailable",
+            "home directory is not available",
+            "Set `PDF_HOME` or `TOOLS_HOME` to a writable directory before retrying.",
+        )
+    })?;
     Ok(home.join(".tools"))
 }
 
-fn pdf_home() -> Result<PathBuf> {
+fn pdf_home() -> CommandResult<PathBuf> {
     if let Ok(value) = env::var("PDF_HOME") {
         return Ok(PathBuf::from(value));
     }
     Ok(tools_home()?.join("pdf"))
 }
 
-fn backup_root() -> Result<PathBuf> {
+fn backup_root() -> CommandResult<PathBuf> {
     Ok(pdf_home()?.join("backups"))
 }
 
-fn reports_root() -> Result<PathBuf> {
+fn reports_root() -> CommandResult<PathBuf> {
     Ok(pdf_home()?.join("reports"))
 }
 
-fn create_backup_snapshot(pool: &ThreadPool, paths: &[PathBuf]) -> Result<PathBuf> {
+fn create_backup_snapshot(pool: &ThreadPool, paths: &[PathBuf]) -> CommandResult<PathBuf> {
     let root = backup_root()?;
-    fs::create_dir_all(&root).with_context(|| format!("failed to create backup root: {}", root.display()))?;
+    fs::create_dir_all(&root).map_err(|err| {
+        CommandError::blocked(
+            "backup_root_unavailable",
+            format!("failed to create backup root: {}", root.display()),
+            "Set `PDF_HOME` or `TOOLS_HOME` to a writable directory, or rerun with `--no-backup`.",
+        )
+        .with_details(json!({
+            "path": root.display().to_string(),
+            "source": err.to_string(),
+        }))
+    })?;
     let timestamp = Local::now().format("%Y-%m-%dT%H-%M-%S").to_string();
     let run_backup_root = root.join(timestamp);
-    fs::create_dir_all(&run_backup_root)
-        .with_context(|| format!("failed to create backup directory: {}", run_backup_root.display()))?;
+    fs::create_dir_all(&run_backup_root).map_err(|err| {
+        CommandError::blocked(
+            "backup_root_unavailable",
+            format!("failed to create backup directory: {}", run_backup_root.display()),
+            "Set `PDF_HOME` or `TOOLS_HOME` to a writable directory, or rerun with `--no-backup`.",
+        )
+        .with_details(json!({
+            "path": run_backup_root.display().to_string(),
+            "source": err.to_string(),
+        }))
+    })?;
 
     pool.install(|| {
-        paths.par_iter().try_for_each(|source| -> Result<()> {
+        paths.par_iter().try_for_each(|source| -> CommandResult<()> {
             let relative = source.strip_prefix("/").unwrap_or(source);
             let destination = run_backup_root.join(relative);
             if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create backup parent path: {}", parent.display()))?;
+                fs::create_dir_all(parent).map_err(|err| {
+                    CommandError::blocked(
+                        "backup_root_unavailable",
+                        format!("failed to create backup parent path: {}", parent.display()),
+                        "Set `PDF_HOME` or `TOOLS_HOME` to a writable directory, or rerun with `--no-backup`.",
+                    )
+                    .with_details(json!({
+                        "path": parent.display().to_string(),
+                        "source": err.to_string(),
+                    }))
+                })?;
             }
-            fs::copy(source, &destination).with_context(|| {
-                format!(
-                    "failed to copy backup file: {} -> {}",
-                    source.display(),
-                    destination.display()
+            fs::copy(source, &destination).map_err(|err| {
+                CommandError::blocked(
+                    "backup_copy_failed",
+                    format!(
+                        "failed to copy backup file: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                    "Verify read and write permissions, or rerun with `--no-backup` if backups are intentionally disabled.",
                 )
+                .with_details(json!({
+                    "sourcePath": source.display().to_string(),
+                    "destinationPath": destination.display().to_string(),
+                    "source": err.to_string(),
+                }))
             })?;
             Ok(())
         })
@@ -140,12 +203,42 @@ fn create_backup_snapshot(pool: &ThreadPool, paths: &[PathBuf]) -> Result<PathBu
     Ok(run_backup_root)
 }
 
-fn write_report(report: &RunReport, timestamp: &str, mode: &str) -> Result<PathBuf> {
+fn write_report(report: &RunReport, timestamp: &str, mode: &str) -> CommandResult<PathBuf> {
     let root = reports_root()?;
-    fs::create_dir_all(&root).with_context(|| format!("failed to create reports root: {}", root.display()))?;
+    fs::create_dir_all(&root).map_err(|err| {
+        CommandError::blocked(
+            "report_root_unavailable",
+            format!("failed to create reports root: {}", root.display()),
+            "Set `PDF_HOME` or `TOOLS_HOME` to a writable directory before retrying.",
+        )
+        .with_details(json!({
+            "path": root.display().to_string(),
+            "source": err.to_string(),
+        }))
+    })?;
     let report_path = root.join(format!("{timestamp}-{mode}.json"));
 
-    let payload = serde_json::to_string_pretty(report).context("failed to serialize report")?;
-    fs::write(&report_path, payload).with_context(|| format!("failed to write report: {}", report_path.display()))?;
+    let payload = serde_json::to_string_pretty(report).map_err(|err| {
+        CommandError::failure(
+            "report_serialization_failed",
+            format!("failed to serialize report: {err}"),
+            "Retry the command after removing unsupported data from the report pipeline.",
+        )
+        .with_details(json!({
+            "reportPath": report_path.display().to_string(),
+            "source": err.to_string(),
+        }))
+    })?;
+    fs::write(&report_path, payload).map_err(|err| {
+        CommandError::blocked(
+            "report_write_failed",
+            format!("failed to write report: {}", report_path.display()),
+            "Set `PDF_HOME` or `TOOLS_HOME` to a writable directory before retrying.",
+        )
+        .with_details(json!({
+            "reportPath": report_path.display().to_string(),
+            "source": err.to_string(),
+        }))
+    })?;
     Ok(report_path)
 }
