@@ -1,4 +1,4 @@
-> `pdf` is a Rust CLI with a JSON-first command surface that introspects itself with `tools` and rewrites PDFs with `optimize`, using `lopdf` for metadata cleanup and `qpdf` for size optimization and output validation.
+> `pdf` is a Rust CLI with a JSON-default command surface that introspects itself with `tools`, checks readiness with `health`, and rewrites PDFs with `optimize`, using `lopdf` for metadata cleanup and `qpdf` for size optimization and output validation.
 
 ## 1. Documentation
 
@@ -36,7 +36,7 @@
 | PDF pipeline | `lopdf` + external `qpdf` | metadata rewrite happens in-process; optimization and validation shell out |
 | Parallelism | `rayon` | file planning and apply work run through a configurable thread pool |
 | Tooling | Bun + Cargo | Bun wraps quality gates and local install; Cargo builds and tests |
-| Tests | Rust unit + integration tests | [`tests/cli_contract.rs`](tests/cli_contract.rs) locks the JSON-first interface |
+| Tests | Rust unit + integration tests | [`tests/cli_contract.rs`](tests/cli_contract.rs) locks the JSON-default and optional Toon interface |
 
 ## 4. Commands
 
@@ -50,7 +50,7 @@
 
 ## 5. Architecture
 
-- [`src/main.rs`](src/main.rs) parses CLI input, defaults to JSON output, routes `tools` and `optimize`, and maps failures to exit code `1` or blocked conditions to exit code `2`.
+- [`src/main.rs`](src/main.rs) parses CLI input, defaults to JSON output, supports optional `--toon`, routes `tools`, `health`, and `optimize`, and maps failures to exit code `1` or blocked conditions to exit code `2`.
 - [`src/tool_registry.rs`](src/tool_registry.rs) is a hand-maintained contract layer for tool names, schemas, examples, and output fields; changes to flags or report fields must update it explicitly.
 - [`src/runner.rs`](src/runner.rs) resolves relative paths against the current working directory, sorts scan targets deterministically, analyzes files in parallel, creates backups before apply-mode writes, and persists run reports.
 - [`src/scanner.rs`](src/scanner.rs) rejects symlink targets and hidden top-level targets, while recursive directory scans silently skip hidden entries and non-PDF files.
@@ -69,8 +69,9 @@
 
 ## 7. Conventions
 
-- Default stdout contract is one JSON object with `{ ok, data | error, meta }`; human-readable output exists only behind `--text`.
-- When the compiled binary is invoked directly, success-path JSON commands are expected to keep stderr empty. [`tests/cli_contract.rs`](tests/cli_contract.rs) asserts this for `tools` and `optimize`.
+- Default stdout contract is one compact JSON envelope with `{ ok, data | error, meta }`; `--toon` emits the same envelope encoded as Toon.
+- Generic text/table/CSV/TSV stdout presentation modes are not part of the public CLI contract.
+- When the compiled binary is invoked directly, success-path structured commands are expected to keep stderr empty. [`tests/cli_contract.rs`](tests/cli_contract.rs) asserts this for `tools`, `health`, and `optimize`.
 - Keep [`src/cli.rs`](src/cli.rs), [`src/tool_registry.rs`](src/tool_registry.rs), [`src/model.rs`](src/model.rs), and [`tests/cli_contract.rs`](tests/cli_contract.rs) aligned whenever flags, tool names, output fields, or example commands change.
 - Preserve the `planned_actions` string constants in [`src/model.rs`](src/model.rs) unless you are intentionally changing the report contract for downstream consumers.
 - Prefer scoped Conventional Commits to match repository history, but note that the current [`commitlint.config.js`](commitlint.config.js) does not enforce scope presence.

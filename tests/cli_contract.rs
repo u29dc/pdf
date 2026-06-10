@@ -21,6 +21,11 @@ fn parse_single_json_line(stdout: &[u8]) -> Value {
     serde_json::from_str(trimmed).expect("stdout json")
 }
 
+fn parse_toon(stdout: &[u8]) -> Value {
+    let text = String::from_utf8(stdout.to_vec()).expect("stdout utf8");
+    toon_format::decode_default(text.trim()).expect("stdout toon")
+}
+
 fn write_sample_pdf(path: &Path) {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -96,10 +101,20 @@ fn tools_catalog_is_json_first_and_discoverable() {
     );
     assert!(payload["data"]["globalFlags"].is_array());
     assert!(payload["data"]["tools"].is_array());
+    assert_eq!(
+        payload["data"]["defaultOutputFormat"],
+        Value::String("json".to_string())
+    );
+    assert_eq!(payload["data"]["outputFormats"], serde_json::json!(["json", "toon"]));
+
+    let flags = payload["data"]["globalFlags"].as_array().expect("global flags array");
+    assert!(flags.iter().any(|flag| flag["name"] == "--toon"));
+    assert!(!flags.iter().any(|flag| flag["name"] == "--text"));
 
     let tools = payload["data"]["tools"].as_array().expect("tools array");
     assert_eq!(payload["meta"]["count"], Value::from(tools.len()));
     assert!(tools.iter().any(|tool| tool["name"] == "pdf.tools"));
+    assert!(tools.iter().any(|tool| tool["name"] == "pdf.health"));
     assert!(tools.iter().any(|tool| tool["name"] == "pdf.optimize"));
 
     let optimize = tools
@@ -121,6 +136,82 @@ fn tools_catalog_is_json_first_and_discoverable() {
     ] {
         assert!(optimize.get(field).is_some(), "optimize tool metadata missing {field}");
     }
+}
+
+#[test]
+fn tools_catalog_supports_toon_output() {
+    let pdf_home = TempDir::new().expect("tempdir");
+    let json_output = run_pdf(&["tools"], &pdf_home);
+    let toon_output = run_pdf(&["tools", "--toon"], &pdf_home);
+
+    assert!(toon_output.status.success(), "tools --toon should succeed");
+    let json_payload = parse_single_json_line(&json_output.stdout);
+    let toon_payload = parse_toon(&toon_output.stdout);
+
+    assert_eq!(json_payload["ok"], toon_payload["ok"]);
+    assert_eq!(json_payload["data"], toon_payload["data"]);
+    assert_eq!(json_payload["meta"]["tool"], toon_payload["meta"]["tool"]);
+    assert_eq!(json_payload["meta"]["count"], toon_payload["meta"]["count"]);
+}
+
+#[test]
+fn health_uses_standard_envelope() {
+    let pdf_home = TempDir::new().expect("tempdir");
+    let output = run_pdf(&["health"], &pdf_home);
+
+    assert!(output.status.success(), "health should succeed");
+    assert!(
+        output.stderr.is_empty(),
+        "json mode should not write diagnostic text to stderr on success"
+    );
+
+    let payload = parse_single_json_line(&output.stdout);
+    assert_eq!(payload["ok"], Value::Bool(true));
+    assert_eq!(payload["meta"]["tool"], Value::String("pdf.health".to_string()));
+    assert!(payload["meta"]["elapsed"].is_u64());
+    assert!(matches!(
+        payload["data"]["status"].as_str(),
+        Some("ready" | "degraded" | "blocked")
+    ));
+    assert!(payload["data"]["checks"].is_array());
+    assert!(payload["data"]["summary"].is_object());
+}
+
+#[test]
+fn health_supports_toon_output() {
+    let pdf_home = TempDir::new().expect("tempdir");
+    let output = run_pdf(&["health", "--toon"], &pdf_home);
+
+    assert!(output.status.success(), "health --toon should succeed");
+    let payload = parse_toon(&output.stdout);
+    assert_eq!(payload["ok"], Value::Bool(true));
+    assert_eq!(payload["meta"]["tool"], Value::String("pdf.health".to_string()));
+    assert!(payload["data"]["checks"].is_array());
+}
+
+#[test]
+fn root_without_command_prints_help_successfully() {
+    let pdf_home = TempDir::new().expect("tempdir");
+    let output = run_pdf(&[], &pdf_home);
+
+    assert!(output.status.success(), "bare pdf should print help and exit 0");
+    assert!(output.stderr.is_empty(), "help should be printed to stdout");
+
+    let help = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(help.contains("Usage:"));
+    assert!(help.contains("--toon"));
+    assert!(!help.contains("--text"));
+}
+
+#[test]
+fn text_flag_is_not_accepted() {
+    let pdf_home = TempDir::new().expect("tempdir");
+    let output = run_pdf(&["--text", "tools"], &pdf_home);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "parse errors should not emit an envelope");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("unexpected argument '--text'") || stderr.contains("unrecognized"));
 }
 
 #[test]

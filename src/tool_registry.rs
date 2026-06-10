@@ -4,6 +4,10 @@ use serde_json::{Value, json};
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCatalogPayload {
     pub version: &'static str,
+    #[serde(rename = "outputFormats")]
+    pub output_formats: Vec<&'static str>,
+    #[serde(rename = "defaultOutputFormat")]
+    pub default_output_format: &'static str,
     #[serde(rename = "globalFlags")]
     pub global_flags: Vec<GlobalFlag>,
     pub tools: Vec<ToolDescriptor>,
@@ -12,6 +16,10 @@ pub struct ToolCatalogPayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolDetailPayload {
     pub version: &'static str,
+    #[serde(rename = "outputFormats")]
+    pub output_formats: Vec<&'static str>,
+    #[serde(rename = "defaultOutputFormat")]
+    pub default_output_format: &'static str,
     #[serde(rename = "globalFlags")]
     pub global_flags: Vec<GlobalFlag>,
     pub tool: ToolDescriptor,
@@ -71,6 +79,8 @@ pub struct ToolExample {
 pub fn catalog_payload() -> ToolCatalogPayload {
     ToolCatalogPayload {
         version: env!("CARGO_PKG_VERSION"),
+        output_formats: output_formats(),
+        default_output_format: "json",
         global_flags: global_flags(),
         tools: tool_registry(),
     }
@@ -80,17 +90,23 @@ pub fn detail_payload(name: &str) -> Option<ToolDetailPayload> {
     let tool = tool_registry().into_iter().find(|tool| tool.name == name)?;
     Some(ToolDetailPayload {
         version: env!("CARGO_PKG_VERSION"),
+        output_formats: output_formats(),
+        default_output_format: "json",
         global_flags: global_flags(),
         tool,
     })
 }
 
+fn output_formats() -> Vec<&'static str> {
+    vec!["json", "toon"]
+}
+
 fn global_flags() -> Vec<GlobalFlag> {
     vec![
         GlobalFlag {
-            name: "--text",
+            name: "--toon",
             value_type: "boolean",
-            description: "Emit human-readable output instead of the default JSON envelope.",
+            description: "Emit Toon instead of the default JSON envelope.",
             default: json!(false),
         },
         GlobalFlag {
@@ -109,7 +125,7 @@ fn global_flags() -> Vec<GlobalFlag> {
 }
 
 fn tool_registry() -> Vec<ToolDescriptor> {
-    let mut tools = vec![tools_tool(), optimize_tool()];
+    let mut tools = vec![tools_tool(), health_tool(), optimize_tool()];
     tools.sort_by(|left, right| left.category.cmp(right.category).then(left.name.cmp(right.name)));
     tools
 }
@@ -117,7 +133,7 @@ fn tool_registry() -> Vec<ToolDescriptor> {
 fn tools_tool() -> ToolDescriptor {
     ToolDescriptor {
         name: "pdf.tools",
-        command: "pdf [--text] tools [name]",
+        command: "pdf tools [name] [--toon]",
         category: "introspection",
         description: "Describe the full CLI tool catalog or one tool in machine-discoverable detail.",
         parameters: vec![ParameterDescriptor {
@@ -131,6 +147,16 @@ fn tools_tool() -> ToolDescriptor {
                 name: "version",
                 value_type: "string",
                 description: "CLI version string.",
+            },
+            FieldDescriptor {
+                name: "outputFormats",
+                value_type: "array",
+                description: "Structured stdout formats supported by the CLI.",
+            },
+            FieldDescriptor {
+                name: "defaultOutputFormat",
+                value_type: "string",
+                description: "Default structured stdout format.",
             },
             FieldDescriptor {
                 name: "globalFlags",
@@ -154,20 +180,24 @@ fn tools_tool() -> ToolDescriptor {
                     "type": "object",
                     "properties": {
                         "version": { "type": "string" },
+                        "outputFormats": { "type": "array", "items": { "type": "string" } },
+                        "defaultOutputFormat": { "type": "string" },
                         "globalFlags": { "type": "array", "items": global_flag_schema() },
                         "tools": { "type": "array", "items": tool_descriptor_schema() }
                     },
-                    "required": ["version", "globalFlags", "tools"],
+                    "required": ["version", "outputFormats", "defaultOutputFormat", "globalFlags", "tools"],
                     "additionalProperties": false
                 },
                 {
                     "type": "object",
                     "properties": {
                         "version": { "type": "string" },
+                        "outputFormats": { "type": "array", "items": { "type": "string" } },
+                        "defaultOutputFormat": { "type": "string" },
                         "globalFlags": { "type": "array", "items": global_flag_schema() },
                         "tool": tool_descriptor_schema()
                     },
-                    "required": ["version", "globalFlags", "tool"],
+                    "required": ["version", "outputFormats", "defaultOutputFormat", "globalFlags", "tool"],
                     "additionalProperties": false
                 }
             ]
@@ -185,8 +215,78 @@ fn tools_tool() -> ToolDescriptor {
         idempotent: true,
         rate_limit: None,
         example: ToolExample {
-            command: "pdf tools pdf.optimize",
+            command: "pdf tools pdf.optimize --toon",
             description: "Fetch the full metadata contract for the optimize command.",
+        },
+    }
+}
+
+fn health_tool() -> ToolDescriptor {
+    ToolDescriptor {
+        name: "pdf.health",
+        command: "pdf health [--toon]",
+        category: "introspection",
+        description: "Check local PDF parser and qpdf readiness.",
+        parameters: vec![],
+        output_fields: vec![
+            FieldDescriptor {
+                name: "status",
+                value_type: "string",
+                description: "Overall readiness status: ready, degraded, or blocked.",
+            },
+            FieldDescriptor {
+                name: "checks",
+                value_type: "array",
+                description: "Per-prerequisite readiness checks.",
+            },
+            FieldDescriptor {
+                name: "summary",
+                value_type: "object",
+                description: "Counts of ready, degraded, and blocked checks.",
+            },
+        ],
+        output_schema: json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "string", "enum": ["ready", "degraded", "blocked"] },
+                "checks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "status": { "type": "string", "enum": ["ready", "degraded", "blocked"] },
+                            "message": { "type": "string" },
+                            "fix": { "type": "string" },
+                            "details": {}
+                        },
+                        "required": ["name", "status", "message"],
+                        "additionalProperties": false
+                    }
+                },
+                "summary": {
+                    "type": "object",
+                    "properties": {
+                        "ready": { "type": "integer", "minimum": 0 },
+                        "degraded": { "type": "integer", "minimum": 0 },
+                        "blocked": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["ready", "degraded", "blocked"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["status", "checks", "summary"],
+            "additionalProperties": false
+        }),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false
+        }),
+        idempotent: true,
+        rate_limit: None,
+        example: ToolExample {
+            command: "pdf health --toon",
+            description: "Check local PDF utility readiness and emit Toon.",
         },
     }
 }
@@ -194,7 +294,7 @@ fn tools_tool() -> ToolDescriptor {
 fn optimize_tool() -> ToolDescriptor {
     ToolDescriptor {
         name: "pdf.optimize",
-        command: "pdf [--text] optimize <path> [--apply] [--estimate-size] [--min-size-savings-bytes <bytes>] [--min-size-savings-percent <percent>] [--jobs <n>] [--no-backup]",
+        command: "pdf optimize <path> [--apply] [--estimate-size] [--min-size-savings-bytes <bytes>] [--min-size-savings-percent <percent>] [--jobs <n>] [--no-backup] [--toon]",
         category: "pdf",
         description: "Scan one PDF or directory tree, normalize metadata, estimate size savings, and optionally apply changes in place.",
         parameters: vec![

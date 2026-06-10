@@ -1,21 +1,21 @@
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::CommandError;
 use crate::model::RunReport;
-use crate::tool_registry::{ToolCatalogPayload, ToolDescriptor, ToolDetailPayload};
+use crate::tool_registry::{ToolCatalogPayload, ToolDetailPayload};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputMode {
+pub enum OutputFormat {
     Json,
-    Text,
+    Toon,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EnvelopeMeta {
     tool: String,
-    elapsed: u128,
+    elapsed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,122 +47,139 @@ struct ErrorEnvelope {
     meta: EnvelopeMeta,
 }
 
-pub fn print_tools_catalog(payload: &ToolCatalogPayload) {
-    println!("pdf {}", payload.version);
-    println!("global flags:");
-    for flag in &payload.global_flags {
-        println!(
-            "  {} ({}) default={} {}",
-            flag.name, flag.value_type, flag.default, flag.description
-        );
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthPayload {
+    pub status: &'static str,
+    pub checks: Vec<HealthCheck>,
+    pub summary: HealthSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthCheck {
+    pub name: &'static str,
+    pub status: &'static str,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthSummary {
+    pub ready: usize,
+    pub degraded: usize,
+    pub blocked: usize,
+}
+
+pub fn health_payload() -> HealthPayload {
+    let mut checks = vec![HealthCheck {
+        name: "pdf_parser",
+        status: "ready",
+        message: "In-process PDF parsing is available.".to_string(),
+        fix: None,
+        details: None,
+    }];
+
+    match which::which("qpdf") {
+        Ok(path) => checks.push(HealthCheck {
+            name: "qpdf",
+            status: "ready",
+            message: "qpdf is available for size estimation and apply-mode optimization.".to_string(),
+            fix: None,
+            details: Some(json!({ "path": path.display().to_string() })),
+        }),
+        Err(_) => checks.push(HealthCheck {
+            name: "qpdf",
+            status: "degraded",
+            message:
+                "qpdf is not available; optimize --estimate-size and optimize --apply cannot run size optimization."
+                    .to_string(),
+            fix: Some("Install qpdf and ensure it is on PATH."),
+            details: None,
+        }),
     }
-    println!("tools:");
-    for tool in &payload.tools {
-        print_tool_summary(tool);
+
+    let summary = HealthSummary {
+        ready: checks.iter().filter(|check| check.status == "ready").count(),
+        degraded: checks.iter().filter(|check| check.status == "degraded").count(),
+        blocked: checks.iter().filter(|check| check.status == "blocked").count(),
+    };
+    let status = if summary.blocked > 0 {
+        "blocked"
+    } else if summary.degraded > 0 {
+        "degraded"
+    } else {
+        "ready"
+    };
+
+    HealthPayload {
+        status,
+        checks,
+        summary,
     }
 }
 
-pub fn print_tool_detail(payload: &ToolDetailPayload) {
-    println!("pdf {}", payload.version);
-    println!("global flags:");
-    for flag in &payload.global_flags {
-        println!(
-            "  {} ({}) default={} {}",
-            flag.name, flag.value_type, flag.default, flag.description
-        );
-    }
-    println!("tool:");
-    print_tool_summary(&payload.tool);
-    println!("  parameters:");
-    for parameter in &payload.tool.parameters {
-        let required = if parameter.required { "required" } else { "optional" };
-        println!(
-            "    {} ({}, {}) {}",
-            parameter.name, parameter.value_type, required, parameter.description
-        );
-    }
-    println!("  output fields:");
-    for field in &payload.tool.output_fields {
-        println!("    {} ({}) {}", field.name, field.value_type, field.description);
-    }
-    println!(
-        "  example: {} {}",
-        payload.tool.example.command, payload.tool.example.description
-    );
-}
-
-pub fn emit_tools_catalog_json(payload: &ToolCatalogPayload, elapsed: u128) {
-    emit_success_json(
-        "pdf.tools",
+pub fn emit_tools_catalog(payload: &ToolCatalogPayload, elapsed: u128, format: OutputFormat) {
+    emit_success(
         payload,
         EnvelopeMeta {
             tool: "pdf.tools".to_string(),
-            elapsed,
+            elapsed: clamp_elapsed(elapsed),
             count: Some(payload.tools.len()),
             total: Some(payload.tools.len()),
             has_more: Some(false),
         },
+        format,
     );
 }
 
-pub fn emit_tool_detail_json(payload: &ToolDetailPayload, elapsed: u128) {
-    emit_success_json(
-        "pdf.tools",
+pub fn emit_tool_detail(payload: &ToolDetailPayload, elapsed: u128, format: OutputFormat) {
+    emit_success(
         payload,
         EnvelopeMeta {
             tool: "pdf.tools".to_string(),
-            elapsed,
+            elapsed: clamp_elapsed(elapsed),
             count: Some(1),
             total: Some(1),
             has_more: Some(false),
         },
+        format,
     );
 }
 
-pub fn print_optimize_report(report: &RunReport) {
-    let mode_label = format!("[{}]", report.mode.to_uppercase());
-    let est_saved_mb = bytes_to_mb(report.summary.estimated_saved_total_bytes);
-    let actual_saved_mb = bytes_to_mb(report.summary.actual_saved_total_bytes);
-
-    print_status_line(
-        &mode_label,
-        &format!(
-            "scanned={} changed={} skipped={} applied={} failed={}",
-            report.summary.total,
-            report.summary.changed,
-            report.summary.skipped,
-            report.summary.applied,
-            report.summary.failed
-        ),
+pub fn emit_health(payload: &HealthPayload, elapsed: u128, format: OutputFormat) {
+    emit_success(
+        payload,
+        EnvelopeMeta {
+            tool: "pdf.health".to_string(),
+            elapsed: clamp_elapsed(elapsed),
+            count: Some(payload.checks.len()),
+            total: Some(payload.checks.len()),
+            has_more: Some(false),
+        },
+        format,
     );
-    print_status_line(
-        "[OPT]",
-        &format!(
-            "checked={} recommended={} est_saved={:.2}MB actual_saved={:.2}MB",
-            report.summary.optimization_checked, report.summary.optimization_recommended, est_saved_mb, actual_saved_mb
-        ),
-    );
-    print_status_line("[REPORT]", &report.report_path);
-    if !report.backup_root.is_empty() {
-        print_status_line("[BACKUP]", &report.backup_root);
-    }
 }
 
-pub fn emit_optimize_json(report: &RunReport, elapsed: u128) {
-    emit_success_json(
-        "pdf.optimize",
+pub fn emit_optimize(report: &RunReport, elapsed: u128, format: OutputFormat) {
+    emit_success(
         report,
         EnvelopeMeta {
             tool: "pdf.optimize".to_string(),
-            elapsed,
+            elapsed: clamp_elapsed(elapsed),
             count: Some(report.files.len()),
             total: Some(report.summary.total),
             has_more: Some(false),
         },
+        format,
     );
 }
 
-pub fn emit_command_error(tool: &str, error: &CommandError, elapsed: u128) {
+pub fn emit_command_error(tool: &str, error: &CommandError, elapsed: u128, format: OutputFormat) {
     let envelope = ErrorEnvelope {
         ok: false,
         error: ErrorBody {
@@ -173,49 +190,66 @@ pub fn emit_command_error(tool: &str, error: &CommandError, elapsed: u128) {
         },
         meta: EnvelopeMeta {
             tool: tool.to_string(),
-            elapsed,
+            elapsed: clamp_elapsed(elapsed),
             count: None,
             total: None,
             has_more: None,
         },
     };
-    match serde_json::to_string(&envelope) {
-        Ok(payload) => println!("{payload}"),
-        Err(_) => println!(
-            "{{\"ok\":false,\"error\":{{\"code\":\"serialization_error\",\"message\":\"failed to serialize error envelope\",\"hint\":\"Retry the command after reducing output size.\"}},\"meta\":{{\"tool\":\"{tool}\",\"elapsed\":{elapsed}}}}}"
-        ),
-    }
+    emit_envelope(&envelope, format, tool, elapsed);
 }
 
-pub fn print_command_error(tool: &str, error: &CommandError) {
-    eprintln!("ERROR [{tool}] {}: {}", error.code(), error.message());
-    eprintln!("HINT  {}", error.hint());
-    if let Some(details) = error.details() {
-        eprintln!("DETAILS {details}");
-    }
-}
-
-fn emit_success_json<T: Serialize>(tool: &str, data: T, meta: EnvelopeMeta) {
+fn emit_success<T: Serialize>(data: T, meta: EnvelopeMeta, format: OutputFormat) {
+    let tool = meta.tool.clone();
+    let elapsed = meta.elapsed;
     let envelope = SuccessEnvelope { ok: true, data, meta };
-    match serde_json::to_string(&envelope) {
+    emit_envelope(&envelope, format, &tool, u128::from(elapsed));
+}
+
+fn emit_envelope<T: Serialize>(envelope: &T, format: OutputFormat, tool: &str, elapsed: u128) {
+    let rendered = match format {
+        OutputFormat::Json => serde_json::to_string(envelope).map_err(|err| err.to_string()),
+        OutputFormat::Toon => toon_format::encode_default(envelope).map_err(|err| err.to_string()),
+    };
+
+    match rendered {
         Ok(payload) => println!("{payload}"),
-        Err(_) => println!(
-            "{{\"ok\":false,\"error\":{{\"code\":\"serialization_error\",\"message\":\"failed to serialize success envelope\",\"hint\":\"Retry the command after reducing output size.\"}},\"meta\":{{\"tool\":\"{tool}\",\"elapsed\":0}}}}"
-        ),
+        Err(_) => emit_serialization_error(tool, elapsed, format),
     }
 }
 
-fn print_status_line(label: &str, message: &str) {
-    const LABEL_WIDTH: usize = 8;
-    println!("{label:<LABEL_WIDTH$} {message}");
+fn emit_serialization_error(tool: &str, elapsed: u128, format: OutputFormat) {
+    let envelope = ErrorEnvelope {
+        ok: false,
+        error: ErrorBody {
+            code: "serialization_error".to_string(),
+            message: "failed to serialize envelope".to_string(),
+            hint: "Retry the command after reducing output size.".to_string(),
+            details: None,
+        },
+        meta: EnvelopeMeta {
+            tool: tool.to_string(),
+            elapsed: clamp_elapsed(elapsed),
+            count: None,
+            total: None,
+            has_more: None,
+        },
+    };
+
+    let rendered = match format {
+        OutputFormat::Json => serde_json::to_string(&envelope).ok(),
+        OutputFormat::Toon => toon_format::encode_default(&envelope).ok(),
+    };
+    if let Some(payload) = rendered {
+        println!("{payload}");
+    } else {
+        println!(
+            "{{\"ok\":false,\"error\":{{\"code\":\"serialization_error\",\"message\":\"failed to serialize error envelope\",\"hint\":\"Retry the command after reducing output size.\"}},\"meta\":{{\"tool\":\"{tool}\",\"elapsed\":{}}}}}",
+            clamp_elapsed(elapsed)
+        );
+    }
 }
 
-fn bytes_to_mb(value: i64) -> f64 {
-    value as f64 / 1_000_000.0
-}
-
-fn print_tool_summary(tool: &ToolDescriptor) {
-    println!("  {} [{}]", tool.name, tool.category);
-    println!("    {}", tool.description);
-    println!("    {}", tool.command);
+fn clamp_elapsed(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }

@@ -5,18 +5,20 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "pdf", version, about = "Personal PDF utility")]
 pub struct Cli {
-    /// Emit human-readable text instead of the default JSON envelope.
+    /// Emit Toon instead of the default JSON envelope.
     #[arg(long, global = true)]
-    pub text: bool,
+    pub toon: bool,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// List available tool commands.
     Tools(ToolsArgs),
+    /// Check local PDF utility readiness.
+    Health,
     /// Sanitize and optimize PDFs for one file or one directory tree.
     Optimize(OptimizeArgs),
 }
